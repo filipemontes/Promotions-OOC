@@ -119,14 +119,14 @@ def generate_m_all_managers_for_master(
     allowed_literal  = _m_list_str(allowed_hod_filenames)
     required_literal = _m_list_str(required_columns_in_order)
 
-    # Build the types list ONCE with the correct double braces {{ ... }}
+    # Build the types list with a SINGLE outer { } (the pairs already have { })
     type_pairs = []
     for c in required_columns_in_order:
         if c.strip().lower() == "manager proposal":
             type_pairs.append(f'{{"{_m_escape(c)}", type number}}')
         else:
             type_pairs.append(f'{{"{_m_escape(c)}", type text}}')
-    types_literal = "{{" + ",".join(type_pairs) + "}}"
+    types_literal = "{" + ",".join(type_pairs) + "}"
 
     m = f'''
 let
