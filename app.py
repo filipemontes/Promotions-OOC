@@ -20,6 +20,170 @@ from builder_backend import (
     build_master_file,
 )
 
+# ---------- NEW: PQ code generators ----------
+def _m_escape(s: str) -> str:
+    return str(s).replace('"', '""')
+
+def _m_list_str(items):
+    return "{" + ",".join(f'"{_m_escape(x)}"' for x in items) + "}"
+
+def _m_field_accessor(colname: str) -> str:
+    return f'[#"{_m_escape(colname)}"]'
+
+def generate_m_hr_view(
+    site_url: str,
+    master_folder: str,
+    master_name: str,
+    hod_name: str,
+    keep_columns_in_order: list,
+    master_sheet_or_table: str = "Master",
+):
+    cols_literal = _m_list_str(keep_columns_in_order)
+    hod_literal  = _m_escape(hod_name)
+    hod_field    = _m_field_accessor("HOD/Manager")
+
+    m = f'''
+let
+  // ---- Where the Master lives ----
+  SiteUrl      = "{_m_escape(site_url)}",
+  MasterFolder = "{_m_escape(master_folder)}",
+  MasterName   = "{_m_escape(master_name)}",
+
+  Files = SharePoint.Files(SiteUrl, [ApiVersion=15]),
+  Pick  = Table.SelectRows(
+            Files,
+            each Text.Contains([Folder Path], MasterFolder)
+              and [Extension] = ".xlsx"
+              and [Name] = MasterName
+              and not Text.StartsWith([Name], "~$")
+          ),
+  Bin   = if Table.RowCount(Pick)=0 then error "Master workbook not found in the folder."
+          else Pick{{0}}[Content],
+  WB    = Excel.Workbook(Bin, true),
+
+  // Prefer Table "{_m_escape(master_sheet_or_table)}"; fallback to Sheet
+  T     = Table.SelectRows(WB, each [Kind]="Table" and [Name] = "{_m_escape(master_sheet_or_table)}"),
+  Src   = if Table.RowCount(T) > 0
+          then T{{0}}[Data]
+          else Table.SelectRows(WB, each [Kind]="Sheet" and [Item] = "{_m_escape(master_sheet_or_table)}"){{0}}[Data],
+
+  Promoted = Table.PromoteHeaders(Src, [PromoteAllScalars=true]),
+
+  // Keep only the selected HOD
+  FilteredHOD = Table.SelectRows(
+                  Promoted,
+                  each try Text.Lower({hod_field}) = Text.Lower("{hod_literal}") otherwise false
+                ),
+
+  // Keep & order columns (create missing as null)
+  Kept  = Table.SelectColumns(FilteredHOD, {cols_literal}, MissingField.UseNull),
+
+  // Simple text typing (adjust as needed)
+  Typed = Table.TransformColumnTypes(
+            Kept,
+            List.Transform({cols_literal}, each {{_, type text}}),
+            "en-US"
+          )
+in
+  Typed
+'''.strip()
+    return m
+
+def generate_m_all_managers(
+    site_url: str,
+    hod_folder: str,
+    allowed_names: list,
+    required_columns_in_order: list,
+    master_sheet_or_table: str = "Master",
+):
+    allowed_literal  = _m_list_str(allowed_names)
+    required_literal = _m_list_str(required_columns_in_order)
+
+    type_pairs = []
+    for c in required_columns_in_order:
+        if c.strip().lower() == "manager proposal":
+            type_pairs.append(f'{{"{_m_escape(c)}", type number}}')
+        else:
+            type_pairs.append(f'{{"{_m_escape(c)}", type text}}')
+    types_literal = "{{" + ",".join(type_pairs) + "}}"
+
+    m = f'''
+let
+  // ── Where the HOD files live ───────────────────────────────────────────────────
+  SiteUrl   = "{_m_escape(site_url)}",
+  HodFolder = "{_m_escape(hod_folder)}",
+
+  AllowedNames = List.Buffer({allowed_literal}),
+
+  // ── Pull those workbooks from that folder (skip temp ~ files) ──────────────────
+  Files = SharePoint.Files(SiteUrl, [ApiVersion = 15]),
+  HodFiles =
+    Table.SelectRows(
+      Files,
+      each Text.Contains([Folder Path], HodFolder)
+        and [Extension] = ".xlsx"
+        and List.Contains(AllowedNames, [Name])
+        and not Text.StartsWith([Name], "~$")
+    ),
+
+  // ── Open each workbook ─────────────────────────────────────────────────────────
+  WB = Table.AddColumn(HodFiles, "WB", each Excel.Workbook([Content], true)),
+  Exploded =
+    Table.ExpandTableColumn(
+      WB, "WB",
+      {{"Name","Data","Item","Kind"}},
+      {{"WB.Name","WB.Data","WB.Item","WB.Kind"}}
+    ),
+
+  // Prefer a Table named "{_m_escape(master_sheet_or_table)}"; else use Sheet
+  PreferTbl = Table.SelectRows(Exploded, each [WB.Kind] = "Table" and [WB.Name] = "{_m_escape(master_sheet_or_table)}"),
+  SourceSet =
+    if Table.RowCount(PreferTbl) > 0 then
+      PreferTbl
+    else
+      Table.SelectRows(Exploded, each [WB.Kind] = "Sheet" and [WB.Item] = "{_m_escape(master_sheet_or_table)}"),
+
+  // Promote headers inside each piece
+  Promoted =
+    Table.TransformColumns(
+      SourceSet,
+      {{"WB.Data", each Table.PromoteHeaders(_, [PromoteAllScalars = true])}}
+    ),
+
+  DataList = if Table.RowCount(Promoted) = 0 then {{}} else Promoted[WB.Data],
+
+  // ── Keep/Order columns and fill missing as null ─────────────────────────────────
+  Required = {required_literal},
+
+  Combined =
+    if List.Count(DataList) = 0
+    then #table(Required, {{}})
+    else Table.Combine(DataList),
+
+  WithNulls =
+    List.Accumulate(
+      List.Difference(Required, Table.ColumnNames(Combined)),
+      Combined,
+      (state, col) => Table.AddColumn(state, col, each null)
+    ),
+
+  Kept = Table.SelectColumns(WithNulls, Required, MissingField.UseNull),
+
+  // Types + de-dup by Employee ID
+  Typed =
+    Table.TransformColumnTypes(
+      Kept,
+      {types_literal},
+      "en-US"
+    ),
+
+  Dedup = Table.Distinct(Typed, {{"Employee ID"}})
+in
+  Dedup
+'''.strip()
+    return m
+# ---------- END PQ code generators ----------
+
 st.set_page_config(page_title="HOD + Master Builder", page_icon="🧩", layout="wide")
 st.title("🧩 HOD Workbooks + MasterFile")
 
@@ -243,7 +407,6 @@ elif st.session_state.step == 3:
     # Quick actions row
     c1, c2, c3, c4 = st.columns(4)
     if c1.button("✨ Auto-fill exact matches"):
-        # try to match unified headers directly to headcount columns (only apply to allowed/display headers)
         for tgt in display_headers:
             if tgt in src_cols:
                 st.session_state.mapping_master[tgt] = tgt
@@ -408,8 +571,6 @@ elif st.session_state.step == 5:
             id_col = st.selectbox(f"Employee ID column in {f.name}", options=cols, index=(cols.index(guess_id) if guess_id in cols else 0), key=f"id_{f.name}")
 
             st.write("**Column mappings (file ➜ unified column in template)**")
-            # Prepare a dynamic editor with two columns: File column, Unified column
-            # We initialize with an empty row to let users start selecting.
             map_df_init = pd.DataFrame({"File column": [None], "Unified column": [None]})
 
             edited = st.data_editor(
@@ -428,7 +589,6 @@ elif st.session_state.step == 5:
                 },
             )
 
-            # Clean up mapping rows
             pairs = []
             for _, row in edited.iterrows():
                 file_col = row.get("File column")
@@ -443,7 +603,6 @@ elif st.session_state.step == 5:
                 "pairs": pairs,
             })
 
-    # Action buttons
     c1, c2, c3 = st.columns(3)
     if c1.button("⬅️ Back to Preview"):
         st.session_state.step = 4
@@ -454,7 +613,6 @@ elif st.session_state.step == 5:
         if base_df is None or base_df.empty or not files_meta:
             return base_df
 
-        # Ensure Headcount Employee ID exists
         if "Employee ID" not in base_df.columns:
             st.error("Headcount must contain 'Employee ID' column to augment.")
             return base_df
@@ -474,39 +632,27 @@ elif st.session_state.step == 5:
                 st.warning(f"Skipping {meta['name']}: selected ID column '{id_col}' not found.")
                 continue
 
-            # Normalize the ID col in the file
             fdf[id_col] = _norm_id_series(fdf[id_col])
 
-            # Keep only needed columns
             keep_cols = [id_col] + [p[0] for p in pairs]
             fdf_narrow = fdf[keep_cols].drop_duplicates(subset=[id_col])
 
-            # Build a temporary merge for each pair (to avoid name collisions)
-            # but we can also merge once with all file columns and then assign
             merged = out.merge(fdf_narrow, how="left", left_on="Employee ID", right_on=id_col, suffixes=("", "_extra"))
 
-            # For each pair: file_col -> unified_target
             for file_col, tgt in pairs:
                 src_series = merged[file_col]
                 if tgt not in merged.columns:
-                    # ensure the target column exists in working df, we will create it
                     merged[tgt] = ""
 
                 if overwrite:
                     merged[tgt] = src_series.where(src_series.notna(), merged[tgt])
                 else:
-                    # fill only where the current value is empty/na
                     is_empty = merged[tgt].isna() | (merged[tgt].astype(str).str.strip() == "")
                     merged.loc[is_empty, tgt] = src_series[is_empty]
 
-                # Also make sure we point mapping to this new source if mapping is empty:
-                # strategy: since df_to_rows uses mapping[target] = source-column-name,
-                # create a true source column with the SAME name as the template target
-                # then set mapping_*[tgt] = tgt (self-source)
                 st.session_state.mapping_master[tgt] = st.session_state.mapping_master.get(tgt) or tgt
                 st.session_state.mapping_perhod[tgt] = st.session_state.mapping_perhod.get(tgt) or tgt
 
-            # Drop the right_on key col if it’s different from Employee ID
             if id_col != "Employee ID":
                 merged = merged.drop(columns=[id_col])
 
@@ -515,9 +661,8 @@ elif st.session_state.step == 5:
         return out
 
     if c3.button("Apply augmentation ✅", type="primary"):
-        base = _get_working_df()  # could already be augmented; apply on top to allow iterative adds
+        base = _get_working_df()
         st.session_state.df_aug = _apply_augment(base, files_meta, overwrite=st.session_state.augment_overwrite)
-        # Update split column choices if new columns arrived
         if st.session_state.hod_col not in _get_working_df().columns:
             st.session_state.hod_col = "Employee ID" if "Employee ID" in _get_working_df().columns else _get_working_df().columns[0]
         if st.session_state.l2_col not in _get_working_df().columns:
@@ -593,7 +738,107 @@ elif st.session_state.step == 6:
         st.error(f"Build error: {e}")
 
     st.markdown("---")
-    if st.button("⬅️ Start over"):
+    c1, c2 = st.columns(2)
+    if c1.button("⬅️ Start over"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+    if c2.button("Generate Power Query code ➡️"):
+        st.session_state.step = 7
+        st.rerun()
+
+# ---------------- Step 7: Generate Power Query code ----------------
+elif st.session_state.step == 7:
+    st.subheader("Step 7 — Generate Power Query (M) code")
+
+    df = _get_working_df()
+    hod_values = []
+    if df is not None and st.session_state.hod_col in df.columns:
+        hod_values = sorted([str(x) for x in df[st.session_state.hod_col].dropna().unique() if str(x).strip() != ""], key=str.lower)
+
+    st.markdown("#### Locations")
+    c1, c2 = st.columns(2)
+    with c1:
+        site_url = st.text_input("SharePoint Site URL", value="https://skyglobal.sharepoint.com/sites/HRTeam")
+        master_folder = st.text_input("Master folder (e.g., /People Ops/Reward/Promotions_OOC_Sept2025)", value="/People Ops/Reward/Promotions_OOC_Sept2025")
+        master_name = st.text_input("Master workbook name", value=st.session_state.master_filename + ".xlsx")
+    with c2:
+        hod_folder = st.text_input("HOD folder (where individual HOD files live)", value="/People Ops/Reward/Promotions_OOC_Sept2025")
+        if hod_values:
+            hod_filter = st.selectbox("Filter HOD for HR_View", options=hod_values)
+        else:
+            hod_filter = st.text_input("Filter HOD for HR_View", value="Bernardo Cardoso")
+
+    st.markdown("#### File names to include (AllowedNames for All_Managers)")
+    default_allowed = [
+        "Promotions_OOC_Sept2025_Bernardo Cardoso.xlsx",
+        "Promotions_OOC_Sept2025_Catarina Guimarães.xlsx",
+        "Promotions_OOC_Sept2025_Diego Valente.xlsx",
+        "Promotions_OOC_Sept2025_George Hill.xlsx",
+        "Promotions_OOC_Sept2025_Hugo Raimundo.xlsx",
+        "Promotions_OOC_Sept2025_Marina Magro.xlsx",
+    ]
+    allowed_df = pd.DataFrame({"Allowed workbook names": default_allowed})
+    allowed_edit = st.data_editor(
+        allowed_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="pq_allowed_names_editor"
+    )
+    allowed_names = allowed_edit["Allowed workbook names"].dropna().astype(str).tolist()
+
+    st.markdown("#### Column orders (edit if your unified names differ)")
+    hr_default = ["Employee ID","Salary Review","Decision","HR Recomendation","HR justification"]
+    hr_df = st.data_editor(
+        pd.DataFrame({"HR_View columns (order)": hr_default}),
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="pq_hr_cols_editor"
+    )
+    hr_cols = hr_df["HR_View columns (order)"].dropna().astype(str).tolist()
+
+    all_mgrs_df = st.data_editor(
+        pd.DataFrame({"All_Managers columns (order)": ALL_MANAGERS_FIXED_COLUMNS}),
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="pq_allmgrs_cols_editor"
+    )
+    all_mgrs_cols = all_mgrs_df["All_Managers columns (order)"].dropna().astype(str).tolist()
+
+    # Generate code
+    m_hr = generate_m_hr_view(
+        site_url=site_url,
+        master_folder=master_folder,
+        master_name=master_name,
+        hod_name=hod_filter,
+        keep_columns_in_order=hr_cols,
+        master_sheet_or_table="Master",
+    )
+    m_all = generate_m_all_managers(
+        site_url=site_url,
+        hod_folder=hod_folder,
+        allowed_names=allowed_names,
+        required_columns_in_order=all_mgrs_cols,
+        master_sheet_or_table="Master",
+    )
+
+    st.markdown("### Power Query — HR_View")
+    st.code(m_hr, language="powerquery")
+    st.download_button("⬇️ Download HR_View.pq", data=m_hr, file_name="HR_View.pq", mime="text/plain")
+
+    st.markdown("### Power Query — All_Managers")
+    st.code(m_all, language="powerquery")
+    st.download_button("⬇️ Download All_Managers.pq", data=m_all, file_name="All_Managers.pq", mime="text/plain")
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    if c1.button("⬅️ Back to Build"):
+        st.session_state.step = 6
+        st.rerun()
+    if c2.button("⬅️ Start over"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
